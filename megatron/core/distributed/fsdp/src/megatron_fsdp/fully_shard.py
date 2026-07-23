@@ -500,8 +500,37 @@ def fully_shard_optimizer(
                 continue
             # Optimizer state is built from wgrad.
             param.grad = torch.zeros_like(param)
-    # Non-lazy optimizer state initialization.
-    optimizer.step()
+    # PR #5976: keep the allocation-only pre-init step numerically inert -- a regular
+    # Adam/AdamW step would advance its step counter (changing the bias correction for the
+    # first real training update) and weight decay could modify params even with zero grads.
+    optimizer_group_settings = []
+    for group in optimizer.param_groups:
+        optimizer_group_settings.append(
+            (group, {key: group[key] for key in ("lr", "weight_decay") if key in group})
+        )
+        group["lr"] = 0.0
+        if "weight_decay" in group:
+            group["weight_decay"] = 0.0
+    try:
+        # Non-lazy optimizer state initialization.
+        optimizer.step()
+    finally:
+        for group, settings in optimizer_group_settings:
+            group.update(settings)
+    for group in optimizer.param_groups:
+        if "step" not in group:
+            continue
+        if isinstance(group["step"], torch.Tensor):
+            group["step"].zero_()
+        else:
+            group["step"] = 0
+    for state in optimizer.state.values():
+        if "step" not in state:
+            continue
+        if isinstance(state["step"], torch.Tensor):
+            state["step"].zero_()
+        else:
+            state["step"] = 0
     optimizer.zero_grad()
 
     # Define a new optimizer.step() method that distributes optimizer state and gradients,
